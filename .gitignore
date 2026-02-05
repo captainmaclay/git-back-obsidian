@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment files
+.env
+
+# IDE / проектные файлы
+.idea/
+*.iml
+
+
+# SSH keys
+ssh_keys/
+
+# Логи
+*.log
+logger.txt
+logger_clean.txt
+loggerm.txt
+syslog.txt
+
+# Другие временные папки / файлы
+tests/
+filter/
+Autosync_git/
+fake_git_temp
+Versions/
+.idea
