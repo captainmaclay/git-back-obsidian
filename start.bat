@@ -1,2 +1,3 @@
 @echo off
-start "" "C:\Users\f\PycharmProjects\2\.venv\Scripts\pythonw.exe" "C:\Users\f\PycharmProjects\2\main.py"
+cd /d "%~dp0"
+start "" ".venv\Scripts\pythonw.exe" "main.py"
