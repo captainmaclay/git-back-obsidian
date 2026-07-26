@@ -48,8 +48,8 @@ def ensure_env_file():
     Не перезаписывает существующие значения.
     """
     default_env = {
-        "GITHUB_USERNAME": "rollexpollex-hash",
-        "GITHUB_REPO": "obsidian",
+        "GITHUB_USERNAME": "",
+        "GITHUB_REPO": "",
         "GITHUB_TOKEN": "",
     }
 
