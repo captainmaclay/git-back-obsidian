@@ -13,7 +13,6 @@ gui/version_ops.py
 Единственный рабочий push живёт в sync/push.py.)
 """
 
-
 import os
 import sys
 import json
