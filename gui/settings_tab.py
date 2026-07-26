@@ -314,10 +314,38 @@ class SettingsTab:
         self.show_toast("Папки: " + ("отслеживаются" if config.TRACK_FOLDERS else "игнорируются"))
 
     def _create_widgets(self):
-        cont = tk.Frame(self.parent, bg="#f8f9fa", bd=2, relief="groove")
-        cont.pack(pady=40, padx=40, fill=tk.BOTH, expand=True)
+        outer = tk.Frame(self.parent, bg="#f8f9fa", bd=2, relief="groove")
+        outer.pack(pady=40, padx=40, fill=tk.BOTH, expand=True)
 
-        tk.Label(cont, text="Settings", font=("Consolas", 18, "bold"), bg="#f8f9fa").pack(pady=(20, 35))
+        tk.Label(outer, text="Settings", font=("Consolas", 18, "bold"), bg="#f8f9fa").pack(pady=(20, 15))
+
+        # Кнопка Save+Exit ЗАКРЕПЛЕНА ВНИЗУ (side=BOTTOM, до контента) — не уедет за экран
+        # ни при каком размере окна.
+        btn_frame = tk.Frame(outer, bg="#f8f9fa")
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=14)
+        tk.Button(
+            btn_frame, text="Save + Exit", font=("Consolas", 13, "bold"),
+            bg="#2563eb", fg="white", activebackground="#1d4ed8",
+            relief="flat", bd=0, padx=28, pady=12, command=self._save_and_exit
+        ).pack()
+
+        # Прокручиваемая область с полями (адаптив: любой контент всегда доступен)
+        canvas = tk.Canvas(outer, bg="#f8f9fa", highlightthickness=0)
+        vsb = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        cont = tk.Frame(canvas, bg="#f8f9fa")
+        _inner = canvas.create_window((0, 0), window=cont, anchor="nw")
+        cont.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(_inner, width=e.width))
+
+        # Колесо мыши — только пока курсор над областью настроек
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         self._create_minimized_row(cont)
 
@@ -464,24 +492,6 @@ class SettingsTab:
         self._bind_entry_hotkeys(self.retry_attempts_entry)
         self._create_clipboard_buttons(attempts_row, self.retry_attempts_var)
         self.retry_attempts_entry.bind("<FocusOut>", lambda e: self._save_all_to_env())
-
-        # ── Save + Exit ─────────────────────────────────────────────────
-        btn_frame = tk.Frame(cont, bg="#f8f9fa")
-        btn_frame.pack(pady=50)
-
-        tk.Button(
-            btn_frame,
-            text="Save + Exit",
-            font=("Consolas", 13, "bold"),
-            bg="#2563eb",
-            fg="white",
-            activebackground="#1d4ed8",
-            relief="flat",
-            bd=0,
-            padx=28,
-            pady=12,
-            command=self._save_and_exit
-        ).pack()
 
         self.sync_minimized_button_state()
 
