@@ -17,6 +17,7 @@ import os
 import tempfile
 import glob
 import pygit2
+from concurrent.futures import ThreadPoolExecutor
 
 from typing import Optional, List, Tuple, Callable
 
@@ -459,6 +460,46 @@ def should_include_in_tree_and_index(rel_path: str) -> bool:
     return False
 
 
+# Кол-во параллельных загрузок blob'ов на GitHub. Умеренное значение, чтобы
+# не поймать вторичный rate-limit GitHub при большом числе одновременных запросов.
+BLOB_UPLOAD_WORKERS = 8
+
+
+def _upload_single_blob(file_path: Path, folder_path: Path, headers: dict, base_url: str):
+    """
+    Заливает ОДИН файл как git-blob через REST API.
+    Возвращает готовую tree-entry (dict) или None при неудаче.
+    Выполняется в отдельном потоке — не трогает общих изменяемых данных.
+    """
+    rel_path = normalize_path(file_path.relative_to(folder_path).as_posix())
+
+    try:
+        content = file_path.read_bytes()
+        b64 = base64.b64encode(content).decode('utf-8')
+    except Exception as e:
+        log_main(f"[TREE-ERROR] {rel_path}: чтение файла: {e}")
+        return None
+
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(
+                f"{base_url}/git/blobs",
+                headers=headers,
+                json={"content": b64, "encoding": "base64"},
+                timeout=30
+            )
+            r.raise_for_status()
+            blob_sha = r.json()['sha']
+            log_soft(f"[TREE-ADD] {rel_path}")
+            return {"path": rel_path, "mode": "100644", "type": "blob", "sha": blob_sha}
+        except Exception as e:
+            log_main(f"[TREE-ERROR] {rel_path} (попытка {attempt}/3): {e}")
+            if attempt < 3:
+                time.sleep(2 * attempt)
+
+    return None
+
+
 def github_api_create_tree_from_folder(folder_path: Path):
     log_both(f"[API-TREE] Создание tree из {folder_path}")
 
@@ -480,37 +521,27 @@ def github_api_create_tree_from_folder(folder_path: Path):
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     base_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}"
 
+    # Параллельная заливка blob'ов — главное ускорение пуша на больших наборах файлов.
+    workers = min(BLOB_UPLOAD_WORKERS, len(all_files))
+    log_both(f"[API-TREE] Параллельная заливка {len(all_files)} blob'ов ({workers} потоков)...")
+
     tree_entries = []
-    for file_path in all_files:
-        rel_path = normalize_path(file_path.relative_to(folder_path).as_posix())
-
-        try:
-            content = file_path.read_bytes()
-            b64 = base64.b64encode(content).decode('utf-8')
-
-            r = requests.post(
-                f"{base_url}/git/blobs",
-                headers=headers,
-                json={"content": b64, "encoding": "base64"},
-                timeout=30
-            )
-            r.raise_for_status()
-            blob_sha = r.json()['sha']
-
-            tree_entries.append({
-                "path": rel_path,
-                "mode": "100644",
-                "type": "blob",
-                "sha": blob_sha
-            })
-
-            log_soft(f"[TREE-ADD] {rel_path}")
-        except Exception as e:
-            log_main(f"[TREE-ERROR] {rel_path}: {e}")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_upload_single_blob, fp, folder_path, headers, base_url)
+            for fp in all_files
+        ]
+        for fut in futures:
+            entry = fut.result()   # исключения уже обработаны внутри воркера
+            if entry:
+                tree_entries.append(entry)
 
     if not tree_entries:
         log_main("[API-TREE] Не удалось создать ни одного blob → tree пустой")
         return None
+
+    if len(tree_entries) < len(all_files):
+        log_main(f"[API-TREE] ВНИМАНИЕ: залито {len(tree_entries)} из {len(all_files)} файлов")
 
     log_both("=== Пути в tree ===")
     for entry in tree_entries:
