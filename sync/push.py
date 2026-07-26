@@ -43,6 +43,7 @@ from core.config import (
 
 # Импорт из make_description.py
 from sync.commit_description import CommitAnalyzer, GitHubCommenter
+from sync import outbox
 
 
 # Получаем директорию скрипта
@@ -825,6 +826,7 @@ def do_push():
         # ─── КРИТИЧЕСКАЯ ЗАЩИТА ОТ ПУСТЫХ ПУШЕЙ ───────────────────────────────
         if not added and not modified and not deleted:
             log_main("[SYNC] Нет ни добавленных, ни изменённых, ни удалённых файлов — push отменён")
+            outbox.clear()  # remote уже актуален → снимаем отложенные записи
             return
 
         has_deleted = len(deleted) > 0
@@ -886,6 +888,7 @@ def do_push():
 
         if added_count == 0:
             log_main("[GIT] После фильтрации не осталось файлов для коммита — push отменён")
+            outbox.clear()  # отправлять нечего → снимаем отложенные записи
             return
 
         commit_sha = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
@@ -918,6 +921,7 @@ def do_push():
 
         if new_commit_sha:
             log_main(f"[PUSH] УСПЕХ: {message}")
+            outbox.clear()  # успешный пуш → очищаем файл-очередь отложенных изменений
 
             log_soft(f"[COMMENT] Планируем отправку комментария через 10 сек...")
             threading.Timer(

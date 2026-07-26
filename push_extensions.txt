@@ -1,0 +1,3 @@
+# write the file extension on a new line
+# пиши расширение файла с новой строки
+md

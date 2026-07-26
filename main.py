@@ -51,6 +51,9 @@ def ensure_env_file():
         "GITHUB_USERNAME": "",
         "GITHUB_REPO": "",
         "GITHUB_TOKEN": "",
+        "RETRY_INTERVAL_MINUTES": "1.5",
+        "RETRY_ATTEMPTS": "2",
+        "TRACK_FOLDERS": "true",
     }
 
     existing = {}

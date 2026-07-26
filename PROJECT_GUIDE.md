@@ -65,18 +65,20 @@ core/                       — infrastructure (unaware of GUI and syncing)
   env_sanitizer.py          — strips leading/trailing spaces from .env values
   log_trim.py               — trims oversized logs
 sync/                       — sync engine and GitHub integration
-  watcher.py                — watchdog handler, debounce; lightweight init (REST prepares the repo)
+  watcher.py                — watchdog handler, debounce; records changes to outbox; starts retry queue
   observer.py               — watchdog observer control (start/stop/restart)
   file_copier.py            — PARALLEL copy of changed files into the scratch folder
   push.py                   — MAIN push: empty-repo init + change collection + REST + force-guard
   commit_description.py     — commit description generation + comment posting
+  outbox.py                 — persistent pending-changes queue (pending_changes.json)
+  retry_queue.py            — background retry: re-pushes pending changes until success
 gui/                        — interface (Tkinter)
-  app.py                    — main window, tabs, tray, background tasks
-  main_tab.py               — "Main" tab: push list, clone, copy
-  settings_tab.py           — "Settings" tab: token, folder, frequency, save to .env
+  app.py                    — main window, tabs, tray, background tasks (watcher always on)
+  main_tab.py               — "Main" tab: push list, clone, copy (no Git-Watcher/Auto-ON toggles)
+  settings_tab.py           — "Settings" tab: token, folder, frequency, retry interval/attempts → .env
   tray.py                   — tray icon, close protocol, Exit button, duplicate warning
-  branches.py               — current branch, branch list, branch picker window
-  version_ops.py            — clone version, fetch pushes/comments, copy SHA
+  branches.py               — current branch (graceful 'main' fallback), branch list/picker
+  version_ops.py            — clone version, fetch pushes (retry + cache), comments, copy SHA
 ```
 
 ## 4. Startup flow (`main.py`) — step by step
@@ -319,6 +321,11 @@ Keys: `GITHUB_USERNAME`, `GITHUB_REPO`, `GITHUB_TOKEN`, `WATCHED_FOLDER`,
 `DEBOUNCE_MINUTES` (or `DEBOUNCE_SECONDS`). Login/repo/token are **not hardcoded** — read
 from `.env` via `os.getenv`. The token needs `repo` scope.
 
+`.env` also holds retry/tracking keys (see §15): `RETRY_INTERVAL_MINUTES` (default `1.5`),
+`RETRY_ATTEMPTS` (default `2`), `TRACK_FOLDERS` (default `true`). The list of **tracked file
+extensions** lives in a separate file `push_extensions.txt` (one per line, default `md`) —
+**not** in `.env`. All of these are editable in the **Settings** tab.
+
 ## 13. Working / service folders
 
 - `fake_git_temp/` — the push scratch sandbox (file copy, tree assembly, `deleted_files/`);
@@ -336,6 +343,68 @@ from `.env` via `os.getenv`. The token needs `repo` scope.
   GitHub tree is rebuilt from files, not from the index.
 - Removed dead code: `main_core.py`, `main_func*.py`, the `filters/` package, the old CLI
   bootstrap and pygit2 init-push.
+
+## 15. Offline resilience — pending-changes queue (outbox) + retry queue
+
+The app never loses changes across network outages or restarts. Two cooperating pieces:
+
+**Outbox (`sync/outbox.py` → `pending_changes.json`).** Every watched change is recorded
+to a persistent file the moment it happens (in `ChangeHandler.on_any_event`): `{ts, type
+(created/modified/deleted/moved), path, is_dir}`. Tracked = folders (only if `TRACK_FOLDERS`
+is on) + files whose extension is listed in `push_extensions.txt`. Entries are deduplicated
+by path. The file is cleared
+**only after a successful push** (`do_push` calls `outbox.clear()` on success or when the
+remote is already up to date). So closing the app before a push, or a failed push, leaves
+the pending changes on disk.
+
+**Retry queue (`sync/retry_queue.py`).** A separate background thread, started in
+`start_watcher()`, independent from the debounce (update-frequency) queue:
+- if the outbox is empty → sleeps `RETRY_INTERVAL_SECONDS` and checks again;
+- if the outbox is non-empty → makes up to `RETRY_ATTEMPTS` push attempts spaced
+  `RETRY_INTERVAL_SECONDS` apart, until the push succeeds (which clears the outbox);
+- if attempts run out while changes remain → waits and repeats (nothing is lost).
+
+**Startup behaviour.** Because the outbox survives restarts, on the next launch the retry
+queue sees a non-empty file on its first check and pushes almost immediately — the queued
+changes are sent without waiting for the 6-min (debounce) frequency. The GitHub commit
+comment is still produced in the usual format, because `CommitAnalyzer` regenerates the
+diff description from the actual files vs remote at push time (the outbox only stores the
+change list, not the diff).
+
+**What is pushed (Settings → Files / Folders).** Tracked file extensions live in
+`push_extensions.txt` (one per line). The parser is tolerant: blank/whitespace lines and
+`#`-comment lines are ignored; only the **first word** of a line is taken (so trailing
+spaces/text don't break parsing); case and leading/trailing dots are normalized
+(`MD`, `.md`, ` md  x` → `.md`). Default is a single line `md` with a bilingual commented
+header. The **Files** row has a `+` button (`plus.png`) that opens this file; edits are
+picked up **live** (mtime cache, no restart). The **Folders** checkbox (`TRACK_FOLDERS`,
+default on, saved to `.env`) toggles whether folder create/delete/rename events are reacted to.
+
+**Parameters** (`.env` + Settings tab): `RETRY_INTERVAL_MINUTES` (default 1.5),
+`RETRY_ATTEMPTS` (default 2), `TRACK_FOLDERS` (default `true`); tracked extensions in
+`push_extensions.txt` (default `md`).
+
+Other recent changes:
+- **Fault-tolerant push list** (`gui/version_ops.py`, `fetch_pushes`): a `requests.Session`
+  with automatic retries/back-off, plus an in-memory + on-disk cache (`push_cache.json`).
+  On a network blip the GUI shows the last known list instead of blanking; `409` (empty
+  repo) is handled quietly.
+- **Current-branch fallback** (`gui/branches.py`): when the scratch folder isn't a git repo
+  yet, `get_current_branch()` returns `"main"` quietly instead of spamming errors.
+- **Main tab simplified**: the `Git-Watcher` and `Auto-ON` checkboxes were removed. The
+  watcher now always runs (no toggle); `Auto-ON` was a no-op and was deleted with its code.
+- **Settings fields**: added `Files` (`+` button opens `push_extensions.txt`), `Folders`
+  (checkbox "react to folder create / delete / rename"), and `Retry Interval` /
+  `Retry Attempts` (with copy/paste buttons). Field order: Git Folder → Files → Folders →
+  GitHub Username → Repository Name → GitHub Token → Update Frequency → Retry Interval →
+  Retry Attempts. All values are space-trimmed on save.
+
+## Service files (runtime, git-ignore these)
+
+`pending_changes.json` (outbox) and `push_cache.json` (push-list cache) are runtime
+artifacts — add them to `.gitignore` (together with `.env`, `Autosync_git/`, `Versions/`,
+`fake_git_temp/`). `push_extensions.txt` is a **user-editable config** (default `md`) — commit
+it as a template or gitignore it, as you prefer.
 
 
 ---
@@ -407,18 +476,20 @@ core/                       — инфраструктура (не знает п
   env_sanitizer.py          — срезает пробелы в начале/конце значений в .env
   log_trim.py               — обрезка разросшихся лог-файлов
 sync/                       — движок синхронизации и работы с GitHub
-  watcher.py                — watchdog-обработчик, debounce; лёгкий init (репо готовит REST)
+  watcher.py                — watchdog-обработчик, debounce; пишет изменения в outbox; старт retry-очереди
   observer.py               — управление watchdog-наблюдателем (start/stop/restart)
   file_copier.py            — ПАРАЛЛЕЛЬНОЕ копирование изменённых файлов в песочницу
   push.py                   — ГЛАВНЫЙ push: init пустого репо + сбор изменений + REST + force-guard
   commit_description.py     — генерация описания коммита и отправка комментария
+  outbox.py                 — персистентная очередь отложенных изменений (pending_changes.json)
+  retry_queue.py            — фоновый retry: досылает отложенные изменения до успеха
 gui/                        — интерфейс (Tkinter)
-  app.py                    — главное окно, вкладки, трей, фоновые задачи
-  main_tab.py               — вкладка «Главная»: список пушей, clone, копирование
-  settings_tab.py           — вкладка «Settings»: токен, папка, частота, сохранение в .env
+  app.py                    — главное окно, вкладки, трей, фоновые задачи (наблюдатель всегда включён)
+  main_tab.py               — вкладка «Главная»: список пушей, clone, копирование (без тумблеров Git-Watcher/Auto-ON)
+  settings_tab.py           — вкладка «Settings»: токен, папка, частота, retry-интервал/попытки → .env
   tray.py                   — иконка в трее, протокол закрытия, кнопка Exit, окно-дубль
-  branches.py               — текущая ветка, список веток, окно выбора ветки
-  version_ops.py            — clone версии, fetch пушей/комментариев, копирование SHA
+  branches.py               — текущая ветка (мягкий fallback на 'main'), список/выбор веток
+  version_ops.py            — clone версии, fetch пушей (retry + кэш), комментарии, копирование SHA
 ```
 
 ## 4. Поток запуска (`main.py`) — что за чем
@@ -674,6 +745,11 @@ API), `change_branch`, `BranchSelectorWindow`, `create_branch_selector_button`. 
 `DEBOUNCE_MINUTES` (или `DEBOUNCE_SECONDS`). Логин/репо/токен **не захардкожены** —
 читаются из `.env` через `os.getenv`. Токену нужен scope `repo`.
 
+В `.env` также ключи retry/отслеживания (см. §15): `RETRY_INTERVAL_MINUTES` (по умолч. `1.5`),
+`RETRY_ATTEMPTS` (по умолч. `2`), `TRACK_FOLDERS` (по умолч. `true`). Список **отслеживаемых
+расширений файлов** хранится в отдельном файле `push_extensions.txt` (по одному на строку,
+по умолч. `md`) — **не** в `.env`. Всё это редактируется во вкладке **Settings**.
+
 ## 13. Рабочие / служебные папки
 
 - `fake_git_temp/` — временная песочница пуша (копия файлов, сборка tree, `deleted_files/`);
@@ -692,5 +768,63 @@ API), `change_branch`, `BranchSelectorWindow`, `create_branch_selector_button`. 
   вхолостую: дерево на GitHub собирается заново из файлов, а не из индекса.
 - Удалён мёртвый код: `main_core.py`, `main_func*.py`, пакет `filters/`, старый CLI-bootstrap
   и pygit2 init-push.
+
+## 15. Отказоустойчивость — очередь отложенных изменений (outbox) + retry-очередь
+
+Приложение не теряет изменения при обрывах сети и перезапусках. Два взаимодействующих механизма:
+
+**Outbox (`sync/outbox.py` → `pending_changes.json`).** Каждое отслеживаемое изменение
+записывается в персистентный файл в момент события (`ChangeHandler.on_any_event`): `{ts,
+type (created/modified/deleted/moved), path, is_dir}`. Отслеживаются папки (только если
+включён `TRACK_FOLDERS`) и файлы с расширениями из `push_extensions.txt`. Дедуп по пути.
+Файл чистится **только после
+успешного пуша** (`do_push` вызывает `outbox.clear()` при успехе или когда remote уже
+актуален). Поэтому закрытие программы до пуша или неудачный пуш оставляют изменения на диске.
+
+**Retry-очередь (`sync/retry_queue.py`).** Отдельный фоновый поток, запускается в
+`start_watcher()`, независимо от debounce (update-frequency) очереди:
+- outbox пуст → ждёт `RETRY_INTERVAL_SECONDS` и проверяет снова;
+- outbox непуст → делает до `RETRY_ATTEMPTS` попыток пуша с паузой `RETRY_INTERVAL_SECONDS`,
+  пока не выйдет (успех очищает outbox);
+- попытки кончились, а изменения остались → ждёт и повторяет (ничего не теряется).
+
+**Поведение на старте.** Так как outbox переживает перезапуск, при следующем запуске
+retry-очередь на первой же проверке видит непустой файл и пушит почти сразу — отложенные
+изменения досылаются, не дожидаясь 6-минутной (debounce) частоты. Комментарий к коммиту на
+GitHub при этом в обычном формате: `CommitAnalyzer` пересобирает дифф-описание из реальных
+файлов vs remote в момент пуша (в очереди хранится только список изменений, не дифф).
+
+**Что пушим (Settings → Files / Folders).** Отслеживаемые расширения хранятся в
+`push_extensions.txt` (по одному на строку). Парсер терпим: пустые строки и строки из
+пробелов игнорируются, строки-комментарии (`#`) — тоже; берётся **только первое слово**
+строки (пробелы/хвост после расширения не мешают); регистр и ведущие/хвостовые точки
+нормализуются (`MD`, `.md`, ` md  x` → `.md`). По умолчанию — одна строка `md` с двуязычным
+закомментированным заголовком. В строке **Files** есть кнопка `+` (`plus.png`), открывающая
+этот файл; правки подхватываются **на лету** (кэш по mtime, без перезапуска). Галочка
+**Folders** (`TRACK_FOLDERS`, по умолч. вкл, сохраняется в `.env`) включает/выключает
+реакцию на события папок (создание/удаление/переименование).
+
+**Параметры** (`.env` + вкладка Settings): `RETRY_INTERVAL_MINUTES` (по умолч. 1.5),
+`RETRY_ATTEMPTS` (по умолч. 2), `TRACK_FOLDERS` (по умолч. `true`); расширения — в
+`push_extensions.txt` (по умолч. `md`).
+
+Прочие недавние изменения:
+- **Отказоустойчивый список пушей** (`gui/version_ops.py`, `fetch_pushes`): `requests.Session`
+  с авто-ретраями/бэк-оффом + кэш в памяти и на диске (`push_cache.json`). При сбое сети GUI
+  показывает последний известный список, а не пустоту; `409` (пустой репо) — тихо.
+- **Fallback текущей ветки** (`gui/branches.py`): когда песочница ещё не git-репозиторий,
+  `get_current_branch()` тихо возвращает `"main"` вместо спама ошибок.
+- **Упрощена «Главная»**: убраны чекбоксы `Git-Watcher` и `Auto-ON`. Наблюдатель теперь
+  работает всегда (без тумблера); `Auto-ON` был пустышкой и удалён вместе с кодом.
+- **Поля Settings**: добавлены `Files` (кнопка `+` открывает `push_extensions.txt`), `Folders`
+  (галочка «react to folder create / delete / rename») и `Retry Interval` / `Retry Attempts`
+  (с кнопками copy/paste). Порядок полей — Git Folder → Files → Folders → GitHub Username →
+  Repository Name → GitHub Token → Update Frequency → Retry Interval → Retry Attempts.
+  Все значения обрезаются от пробелов при сохранении.
+
+## Служебные файлы (рантайм, добавить в .gitignore)
+
+`pending_changes.json` (outbox) и `push_cache.json` (кэш списка пушей) — рантайм-артефакты.
+Добавь их в `.gitignore` (вместе с `.env`, `Autosync_git/`, `Versions/`, `fake_git_temp/`).
 
 ---

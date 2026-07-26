@@ -30,7 +30,6 @@ class MainTab:
         self.commit_entry = None
         self.comment_box = None
         self.log_box_main = None
-        self.watcher_status_label = None
         self.branch_button = None
 
         # Данные
@@ -84,22 +83,6 @@ class MainTab:
 
         tk.Button(copy_f, text="🔗", width=3, command=self.copy_profile_url,
                   font=("Arial", 13)).pack(side=tk.LEFT)
-
-        # Чекбоксы управления
-        chk_f = tk.Frame(top)
-        chk_f.pack(fill=tk.X, pady=10)
-
-        tk.Checkbutton(chk_f, text="Git-Watcher", variable=self.app.watcher_var,
-                       command=self.app.toggle_watcher)\
-            .pack(side=tk.LEFT, padx=(0, 24))
-
-        self.watcher_status_label = tk.Label(
-            chk_f, text="Git-Watcher: Active", width=20, anchor="w")
-        self.watcher_status_label.pack(side=tk.LEFT)
-
-        tk.Checkbutton(chk_f, text="Auto-ON", variable=self.app.auto_on_var,
-                       command=self.app.toggle_auto_on)\
-            .pack(side=tk.LEFT, padx=(40, 0))
 
         # Разделители (paned windows)
         paned_v = ttk.PanedWindow(f, orient=tk.VERTICAL)

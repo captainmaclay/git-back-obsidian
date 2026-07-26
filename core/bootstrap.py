@@ -88,6 +88,9 @@ def ensure_env_file():
             'GITHUB_TOKEN=""\n'
             'WATCHED_FOLDER=""\n'
             'DEBOUNCE_MINUTES=""\n'
+            'RETRY_INTERVAL_MINUTES="1.5"\n'
+            'RETRY_ATTEMPTS="2"\n'
+            'TRACK_FOLDERS="true"\n'
         )
         with open(ENV_FILE, 'w', encoding='utf-8') as f:
             f.write(content)

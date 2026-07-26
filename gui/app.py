@@ -36,8 +36,6 @@ class GitVersionRestoreApp:
         self.root.minsize(780, 620)
 
         # Переменные состояния
-        self.watcher_var = tk.BooleanVar(value=True)
-        self.auto_on_var = tk.BooleanVar(value=True)
         self.start_minimized_var = tk.BooleanVar(value=False)
 
         self.current_branch_var = tk.StringVar(value=get_current_branch())
@@ -359,32 +357,14 @@ class GitVersionRestoreApp:
             widget.config(state=state)
 
     # ───────────────────────────────────────────────────────────────
-    # Watcher & Auto-ON
-    # ───────────────────────────────────────────────────────────────
-
-    def toggle_watcher(self) -> None:
-        if self.watcher_var.get():
-            start_watcher()
-            self.main_tab.watcher_status_label.config(text="Git-Watcher: Active")
-            log_main("Git-Watcher запущен")
-        else:
-            stop_watcher()
-            self.main_tab.watcher_status_label.config(text="Git-Watcher: Paused")
-            log_main("Git-Watcher остановлен")
-
-    def toggle_auto_on(self) -> None:
-        state = "включён" if self.auto_on_var.get() else "выключен"
-        log_main(f"Auto-ON теперь {state}")
-
-    # ───────────────────────────────────────────────────────────────
     # Фоновые задачи
     # ───────────────────────────────────────────────────────────────
 
     def _start_background_tasks(self) -> None:
         threading.Thread(target=self.main_tab.load_pushes, daemon=True).start()
 
-        if self.watcher_var.get():
-            self.toggle_watcher()
+        # Наблюдатель авто-пуша запускается всегда (без GUI-переключателя)
+        start_watcher()
 
         threading.Thread(target=initial_check_loop, daemon=True).start()
 

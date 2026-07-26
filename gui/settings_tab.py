@@ -24,7 +24,11 @@ from configparser import ConfigParser
 from PIL import Image, ImageTk
 
 from core.logger import log_main, log_soft
-from core.config import settings, save_watched_folder
+from core.config import (
+    settings, save_watched_folder, RETRY_INTERVAL_SECONDS, RETRY_ATTEMPTS,
+    TRACK_FOLDERS, EXTENSIONS_FILE, get_tracked_extensions, ensure_extensions_file,
+)
+import core.config as config  # для «живого» обновления TRACK_FOLDERS
 from core.env_sanitizer import sanitize_env_file
 
 
@@ -46,12 +50,20 @@ class SettingsTab:
         # Update Frequency в минутах — начальное значение
         self.update_freq_var = tk.StringVar(value=f"{settings.debounce_seconds / 60:.1f}")
 
+        # Retry-очередь: интервал повторных попыток (мин) и число попыток
+        self.retry_interval_var = tk.StringVar(value=f"{RETRY_INTERVAL_SECONDS / 60:.1f}")
+        self.retry_attempts_var = tk.StringVar(value=str(RETRY_ATTEMPTS))
+
+        # Отслеживать события папок (создание/удаление/переименование). По умолчанию вкл.
+        self.track_folders_var = tk.BooleanVar(value=TRACK_FOLDERS)
+
         self.show_token_var = tk.BooleanVar(value=False)
 
         self.eye_closed_icon = None
         self.eye_open_icon   = None
         self.folder_icon     = None
         self.refresh_icon    = None
+        self.plus_icon       = None
 
         self._load_icons()
         self._create_widgets()
@@ -78,12 +90,16 @@ class SettingsTab:
             refresh_img = Image.open(refresh_path).resize((20, 20)) if refresh_path.exists() else None
             self.refresh_icon = ImageTk.PhotoImage(refresh_img) if refresh_img else None
 
+            plus_path = ASSETS_DIR / "plus.png"
+            self.plus_icon = ImageTk.PhotoImage(Image.open(plus_path).resize((22, 22))) if plus_path.exists() else None
+
             log_soft("Все иконки загружены успешно")
 
         except Exception as e:
             log_main(f"Ошибка загрузки иконок: {e}")
             self.copy_icon = self.paste_icon = self.folder_icon = self.refresh_icon = None
             self.eye_closed_icon = self.eye_open_icon = None
+            self.plus_icon = None
 
     def show_toast(self, text: str):
         toast = tk.Toplevel(self.app.root)
@@ -229,6 +245,24 @@ class SettingsTab:
                 log_main(f"[SETTINGS] Некорректное значение минут: '{minutes_str}' → не сохраняем")
                 self.show_toast("Некорректное значение минут — не сохранено")
 
+            # Retry-очередь: интервал (мин) и число попыток
+            try:
+                ri_str = self.retry_interval_var.get().strip()
+                if ri_str and float(ri_str) > 0:
+                    new_values["RETRY_INTERVAL_MINUTES"] = f"{float(ri_str):.2f}"
+            except ValueError:
+                log_main(f"[SETTINGS] Некорректный retry-интервал: '{ri_str}' → не сохраняем")
+
+            try:
+                ra_str = self.retry_attempts_var.get().strip()
+                if ra_str and int(ra_str) >= 1:
+                    new_values["RETRY_ATTEMPTS"] = str(int(ra_str))
+            except ValueError:
+                log_main(f"[SETTINGS] Некорректное число попыток: '{ra_str}' → не сохраняем")
+
+            # Отслеживать события папок (галочка)
+            new_values["TRACK_FOLDERS"] = "true" if self.track_folders_var.get() else "false"
+
             new_lines = []
             keys_written = set()
 
@@ -259,6 +293,26 @@ class SettingsTab:
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось сохранить .env\n{e}")
 
+    def _open_extensions_file(self):
+        """Открывает push_extensions.txt в системном редакторе (кнопка «+»)."""
+        ensure_extensions_file()
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(EXTENSIONS_FILE))
+            elif sys.platform == "darwin":
+                os.system(f"open '{EXTENSIONS_FILE}'")
+            else:
+                os.system(f"xdg-open '{EXTENSIONS_FILE}'")
+            self.show_toast("Открыт список расширений")
+        except Exception as e:
+            log_main(f"Не удалось открыть {EXTENSIONS_FILE.name}: {e}")
+
+    def _on_toggle_track_folders(self):
+        """Галочка Folders: живое обновление флага + запись в .env."""
+        config.TRACK_FOLDERS = bool(self.track_folders_var.get())
+        self._save_all_to_env()
+        self.show_toast("Папки: " + ("отслеживаются" if config.TRACK_FOLDERS else "игнорируются"))
+
     def _create_widgets(self):
         cont = tk.Frame(self.parent, bg="#f8f9fa", bd=2, relief="groove")
         cont.pack(pady=40, padx=40, fill=tk.BOTH, expand=True)
@@ -283,22 +337,39 @@ class SettingsTab:
         tk.Button(watched_row, image=self.folder_icon, bg="#f8f9fa", relief="flat", bd=0,
                   command=self._select_watched_folder).pack(side=tk.LEFT, padx=(4, 4))
 
-        # ── Update Frequency (minutes) ──────────────────────────────────
-        freq_row = tk.Frame(cont, bg="#f8f9fa")
-        freq_row.pack(fill=tk.X, pady=16, padx=10)
+        # ── Files (расширения для пуша) ─────────────────────────────────
+        files_row = tk.Frame(cont, bg="#f8f9fa")
+        files_row.pack(fill=tk.X, pady=16, padx=10)
 
-        tk.Label(freq_row, text="Update Frequency", font=("Consolas", 12), bg="#f8f9fa", width=24, anchor="w").pack(side=tk.LEFT, padx=(12, 12))
+        tk.Label(files_row, text="Files", font=("Consolas", 12), bg="#f8f9fa", width=24, anchor="w").pack(side=tk.LEFT, padx=(12, 12))
 
-        self.update_freq_entry = tk.Entry(
-            freq_row, textvariable=self.update_freq_var, font=("Consolas", 12), width=10, relief="solid", bd=1
+        self.files_ext_entry = tk.Entry(
+            files_row, font=("Consolas", 12), width=30, relief="solid", bd=1, readonlybackground="#ffffff"
         )
-        self.update_freq_entry.pack(side=tk.LEFT, padx=(8, 4))
+        self.files_ext_entry.insert(0, ", ".join(get_tracked_extensions()))
+        self.files_ext_entry.config(state="readonly")
+        self.files_ext_entry.pack(side=tk.LEFT, padx=(8, 4), fill=tk.X, expand=True)
 
-        tk.Label(freq_row, text="minutes", font=("Consolas", 12), bg="#f8f9fa").pack(side=tk.LEFT, padx=(4, 12))
+        tk.Button(
+            files_row, image=self.plus_icon, text=("" if self.plus_icon else "+"),
+            compound=tk.LEFT, bg="#f8f9fa", relief="flat", bd=0,
+            font=("Consolas", 14, "bold"),
+            command=self._open_extensions_file
+        ).pack(side=tk.LEFT, padx=(4, 4))
 
-        self._bind_entry_hotkeys(self.update_freq_entry)
-        self._create_clipboard_buttons(freq_row, self.update_freq_var)
-        self.update_freq_entry.bind("<FocusOut>", lambda e: self._save_all_to_env())
+        # ── Folders (реагировать на события папок) ──────────────────────
+        folders_row = tk.Frame(cont, bg="#f8f9fa")
+        folders_row.pack(fill=tk.X, pady=16, padx=10)
+
+        tk.Label(folders_row, text="Folders", font=("Consolas", 12), bg="#f8f9fa", width=24, anchor="w").pack(side=tk.LEFT, padx=(12, 12))
+
+        tk.Checkbutton(
+            folders_row,
+            text="react to folder create / delete / rename",
+            variable=self.track_folders_var, bg="#f8f9fa", font=("Consolas", 10),
+            activebackground="#f8f9fa", anchor="w",
+            command=self._on_toggle_track_folders
+        ).pack(side=tk.LEFT, padx=(8, 4))
 
         # ── GitHub Username ─────────────────────────────────────────────
         username_row = tk.Frame(cont, bg="#f8f9fa")
@@ -346,6 +417,53 @@ class SettingsTab:
         self._bind_entry_hotkeys(self.token_entry)
         self._create_clipboard_buttons(token_row, self.github_token_var)
         self.token_entry.bind("<FocusOut>", lambda e: self._save_all_to_env())
+
+        # ── Update Frequency (minutes) ──────────────────────────────────
+        freq_row = tk.Frame(cont, bg="#f8f9fa")
+        freq_row.pack(fill=tk.X, pady=16, padx=10)
+
+        tk.Label(freq_row, text="Update Frequency", font=("Consolas", 12), bg="#f8f9fa", width=24, anchor="w").pack(side=tk.LEFT, padx=(12, 12))
+
+        self.update_freq_entry = tk.Entry(
+            freq_row, textvariable=self.update_freq_var, font=("Consolas", 12), width=10, relief="solid", bd=1
+        )
+        self.update_freq_entry.pack(side=tk.LEFT, padx=(8, 4))
+
+        tk.Label(freq_row, text="minutes", font=("Consolas", 12), bg="#f8f9fa").pack(side=tk.LEFT, padx=(4, 12))
+
+        self._bind_entry_hotkeys(self.update_freq_entry)
+        self._create_clipboard_buttons(freq_row, self.update_freq_var)
+        self.update_freq_entry.bind("<FocusOut>", lambda e: self._save_all_to_env())
+
+        # ── Retry Interval (minutes) ────────────────────────────────────
+        retry_row = tk.Frame(cont, bg="#f8f9fa")
+        retry_row.pack(fill=tk.X, pady=16, padx=10)
+
+        tk.Label(retry_row, text="Retry Interval", font=("Consolas", 12), bg="#f8f9fa", width=24, anchor="w").pack(side=tk.LEFT, padx=(12, 12))
+
+        self.retry_interval_entry = tk.Entry(
+            retry_row, textvariable=self.retry_interval_var, font=("Consolas", 12), width=10, relief="solid", bd=1
+        )
+        self.retry_interval_entry.pack(side=tk.LEFT, padx=(8, 4))
+        tk.Label(retry_row, text="minutes", font=("Consolas", 12), bg="#f8f9fa").pack(side=tk.LEFT, padx=(4, 12))
+        self._bind_entry_hotkeys(self.retry_interval_entry)
+        self._create_clipboard_buttons(retry_row, self.retry_interval_var)
+        self.retry_interval_entry.bind("<FocusOut>", lambda e: self._save_all_to_env())
+
+        # ── Retry Attempts ──────────────────────────────────────────────
+        attempts_row = tk.Frame(cont, bg="#f8f9fa")
+        attempts_row.pack(fill=tk.X, pady=16, padx=10)
+
+        tk.Label(attempts_row, text="Retry Attempts", font=("Consolas", 12), bg="#f8f9fa", width=24, anchor="w").pack(side=tk.LEFT, padx=(12, 12))
+
+        self.retry_attempts_entry = tk.Entry(
+            attempts_row, textvariable=self.retry_attempts_var, font=("Consolas", 12), width=10, relief="solid", bd=1
+        )
+        self.retry_attempts_entry.pack(side=tk.LEFT, padx=(8, 4))
+        tk.Label(attempts_row, text="attempts", font=("Consolas", 12), bg="#f8f9fa").pack(side=tk.LEFT, padx=(4, 12))
+        self._bind_entry_hotkeys(self.retry_attempts_entry)
+        self._create_clipboard_buttons(attempts_row, self.retry_attempts_var)
+        self.retry_attempts_entry.bind("<FocusOut>", lambda e: self._save_all_to_env())
 
         # ── Save + Exit ─────────────────────────────────────────────────
         btn_frame = tk.Frame(cont, bg="#f8f9fa")

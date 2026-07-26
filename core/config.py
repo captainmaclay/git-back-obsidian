@@ -100,6 +100,102 @@ else:
     DEBOUNCE_SECONDS = int(os.getenv("DEBOUNCE_SECONDS", DEFAULT_DEBOUNCE_SECONDS))
     log_soft(f"[CONFIG] DEBOUNCE_SECONDS = {DEBOUNCE_SECONDS} сек (из .env или по умолчанию)")
 
+
+# ────────────────────────────────────────────────────────────────
+# Retry-очередь отложенных пушей (outbox)
+# ────────────────────────────────────────────────────────────────
+
+# Интервал повторных попыток пуша, пока есть неотправленные изменения (минуты)
+DEFAULT_RETRY_INTERVAL_MINUTES = 1.5
+try:
+    _retry_min = float((os.getenv("RETRY_INTERVAL_MINUTES", "").strip() or DEFAULT_RETRY_INTERVAL_MINUTES))
+    RETRY_INTERVAL_SECONDS = int(_retry_min * 60) if _retry_min > 0 else int(DEFAULT_RETRY_INTERVAL_MINUTES * 60)
+except (ValueError, TypeError):
+    RETRY_INTERVAL_SECONDS = int(DEFAULT_RETRY_INTERVAL_MINUTES * 60)
+
+# Сколько попыток подряд делать в одном цикле retry (по умолчанию 2)
+DEFAULT_RETRY_ATTEMPTS = 2
+try:
+    RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "").strip() or DEFAULT_RETRY_ATTEMPTS)
+    if RETRY_ATTEMPTS < 1:
+        RETRY_ATTEMPTS = DEFAULT_RETRY_ATTEMPTS
+except (ValueError, TypeError):
+    RETRY_ATTEMPTS = DEFAULT_RETRY_ATTEMPTS
+
+# ── Что пушим: флаг папок (в .env) + расширения файлов (в txt-файле) ────────────
+
+# Реагировать ли на события ПАПОК (создание/удаление/переименование).
+# Галочка в Settings → сохраняется в .env. По умолчанию включено.
+TRACK_FOLDERS = os.getenv("TRACK_FOLDERS", "true").strip().lower() not in ("0", "false", "no", "off", "")
+
+# Отслеживаемые расширения файлов хранятся в отдельном txt (по одному на строке),
+# редактируется кнопкой «+» в Settings. По умолчанию — одна строка: md.
+EXTENSIONS_FILE = SCRIPT_DIR / "push_extensions.txt"
+
+_DEFAULT_EXTENSIONS_TXT = (
+    "# write the file extension on a new line\n"
+    "# пиши расширение файла с новой строки\n"
+    "md\n"
+)
+
+
+def ensure_extensions_file() -> None:
+    """Создаёт push_extensions.txt со значением по умолчанию, если его нет."""
+    try:
+        if not EXTENSIONS_FILE.exists():
+            EXTENSIONS_FILE.write_text(_DEFAULT_EXTENSIONS_TXT, encoding="utf-8")
+    except Exception as e:
+        log_main(f"[CONFIG] Не удалось создать {EXTENSIONS_FILE.name}: {e}")
+
+
+def _parse_extensions(text: str) -> tuple:
+    """
+    Парсит push_extensions.txt терпимо к «грязи»:
+    - пустые строки и строки из одних пробелов игнорируются;
+    - строки-комментарии (начинаются с #) игнорируются;
+    - у строки берётся ТОЛЬКО первое слово (пробелы/хвост после расширения не мешают);
+    - ведущие/хвостовые точки и регистр нормализуются: 'MD', '.md', ' md  x' → '.md'.
+    """
+    exts = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        token = line.split()[0].strip().lower().strip(".")  # первое слово, без точек/пробелов
+        if not token:
+            continue
+        ext = "." + token
+        if ext not in exts:
+            exts.append(ext)
+    return tuple(exts) or (".md",)
+
+
+# Кэш с проверкой mtime: правки txt подхватываются без перезапуска приложения.
+_ext_cache = {"mtime": None, "value": (".md",)}
+
+
+def get_tracked_extensions() -> tuple:
+    """Актуальные отслеживаемые расширения (перечитывает txt при изменении файла)."""
+    ensure_extensions_file()
+    try:
+        mtime = EXTENSIONS_FILE.stat().st_mtime
+        if _ext_cache["mtime"] != mtime:
+            _ext_cache["value"] = _parse_extensions(EXTENSIONS_FILE.read_text(encoding="utf-8"))
+            _ext_cache["mtime"] = mtime
+    except Exception:
+        pass
+    return _ext_cache["value"]
+
+
+ensure_extensions_file()
+TRACKED_EXTENSIONS = get_tracked_extensions()   # снимок на старте (для констант-потребителей)
+
+# Файл-очередь отложенных изменений — чистится ТОЛЬКО после успешного пуша
+PENDING_CHANGES_FILE = SCRIPT_DIR / "pending_changes.json"
+
+log_soft(f"[CONFIG] RETRY: интервал {RETRY_INTERVAL_SECONDS} сек, попыток {RETRY_ATTEMPTS}; "
+         f"папки: {'вкл' if TRACK_FOLDERS else 'выкл'}; расширения: {TRACKED_EXTENSIONS}")
+
 # ────────────────────────────────────────────────────────────────
 # Debounce таймер и блокировка
 # ────────────────────────────────────────────────────────────────
@@ -319,6 +415,14 @@ __all__ = [
     "GITHUB_REPO_URL",
     "GITHUB_PROFILE_URL",
     "is_github_configured",
+    "RETRY_INTERVAL_SECONDS",
+    "RETRY_ATTEMPTS",
+    "TRACKED_EXTENSIONS",
+    "get_tracked_extensions",
+    "ensure_extensions_file",
+    "EXTENSIONS_FILE",
+    "TRACK_FOLDERS",
+    "PENDING_CHANGES_FILE",
     "DEBOUNCE_SECONDS",
     "debounce_timer",
     "push_lock",

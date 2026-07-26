@@ -31,6 +31,7 @@ from core.config import (
     GITHUB_REPO,
     GITHUB_TOKEN,
     is_github_configured,
+    WATCHED_FOLDER,
 )
 
 from sync.observer import (
@@ -38,6 +39,16 @@ from sync.observer import (
     stop_observer,
     is_observer_running
 )
+from sync import outbox
+import core.config as config  # для «живого» флага TRACK_FOLDERS
+
+
+def _rel_to_vault(p: str) -> str:
+    """Путь относительно отслеживаемой папки (для читаемых записей в outbox)."""
+    try:
+        return Path(p).resolve().relative_to(Path(WATCHED_FOLDER).resolve()).as_posix()
+    except Exception:
+        return Path(p).name
 
 # ─────────────────────────────────────────────
 # Locks + state
@@ -65,11 +76,25 @@ class ChangeHandler(FileSystemEventHandler):
 
     def on_any_event(self, event):
 
-        if event.is_directory:
-            return
-
         if self._ignore(event.src_path):
             return
+
+        is_dir = event.is_directory
+
+        # Папки: реагируем на их события (создание/удаление/переименование) только
+        # если включён флаг TRACK_FOLDERS (галочка в Settings → .env). По умолчанию вкл.
+        if is_dir and not config.TRACK_FOLDERS:
+            return
+
+        # Регистрируем изменение в файл-очереди (файлы — по расширениям из
+        # push_extensions.txt; папки — по флагу). Очередь чистится только после пуша.
+        try:
+            outbox.record(event.event_type, _rel_to_vault(event.src_path), is_dir=is_dir)
+            dest = getattr(event, "dest_path", None)
+            if dest:  # перемещение/переименование
+                outbox.record("moved", _rel_to_vault(dest), is_dir=is_dir)
+        except Exception as e:
+            log_soft(f"[watchdog] Не удалось записать изменение в очередь: {e}")
 
         with _push_lock:
             if _push_in_progress:
@@ -179,11 +204,23 @@ def start_watcher():
 
     start_observer()
 
+    # Отдельная retry-очередь: досылает отложенные изменения, если пуш не удался.
+    try:
+        from sync.retry_queue import start_retry_queue
+        start_retry_queue()
+    except Exception as e:
+        log_main(f"[watcher] Не удалось запустить retry-очередь: {e}")
+
 
 def stop_watcher():
     global _watcher_running
     _watcher_running = False
     stop_observer()
+    try:
+        from sync.retry_queue import stop_retry_queue
+        stop_retry_queue()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────
