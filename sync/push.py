@@ -304,8 +304,9 @@ def github_api_main_ref() -> Tuple[str, Optional[str]]:
     for attempt in range(1, 4):
         try:
             r = requests.get(url, headers=headers, timeout=30)
-            if r.status_code == 404:
-                log_both("[API-HEAD] main отсутствует (404) → репозиторий пуст, нужен первый коммит")
+            # Пустой репозиторий: GitHub отдаёт 409 'Git Repository is empty' (иногда 404).
+            if r.status_code in (404, 409):
+                log_both(f"[API-HEAD] main отсутствует ({r.status_code}) → репозиторий пуст, нужен первый коммит")
                 return ("absent", None)
             r.raise_for_status()
             sha = r.json()['object']['sha']
@@ -641,41 +642,45 @@ def is_force_push_allowed() -> bool:
     return allowed
 
 
-def _github_api_first_commit(tree_sha, commit_message, headers, base_url):
+def github_api_ensure_repo_initialized() -> bool:
     """
-    ПЕРВЫЙ коммит в пустой репозиторий: создаёт коммит БЕЗ родителей и заводит
-    ветку main через POST /git/refs (её ещё нет, поэтому не PATCH).
-    Аналог веб-инструкции 'git init … git commit … git branch -M main … git push',
-    но полностью через REST API с токеном из .env.
+    Гарантирует, что в репозитории есть хотя бы один коммит.
+
+    Низкоуровневый Git Data API (/git/blobs, /git/trees, /git/commits) НЕ работает
+    на полностью пустом репозитории — отдаёт 409 'Git Repository is empty'.
+    Единственный способ создать самый первый коммит через API — Contents API
+    (PUT /contents/<path>): он создаёт первый коммит и ветку main. После него
+    обычный blobs/trees-поток работает нормально.
+
+    Возвращает:
+      True  — репозиторий уже инициализирован ИЛИ только что инициализирован;
+      False — пусто и инициализировать не удалось, либо состояние неизвестно (сеть)
+              → push нужно отменить.
     """
-    log_both("[FIRST-COMMIT] Пустой репозиторий → создаём первый коммит и ветку main")
+    status, _ = github_api_main_ref()
+    if status == "exists":
+        return True
+    if status == "unknown":
+        log_main("[INIT-REPO] Не удалось определить состояние репозитория (сеть?) → push отменён")
+        return False
+
+    # status == "absent" → репозиторий пуст, создаём первый коммит через Contents API
+    log_both("[INIT-REPO] Репозиторий пуст → первый коммит через Contents API (.gitkeep)")
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/.gitkeep"
+    payload = {
+        "message": "Initial commit (AutoSync)",
+        "content": base64.b64encode(b"\n").decode("utf-8"),
+        "branch": "main",
+    }
     try:
-        r = requests.post(
-            f"{base_url}/git/commits",
-            headers=headers,
-            json={"message": commit_message, "tree": tree_sha, "parents": []},
-            timeout=30
-        )
+        r = requests.put(url, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
-        new_commit_sha = r.json()['sha']
-
-        r_ref = requests.post(
-            f"{base_url}/git/refs",
-            headers=headers,
-            json={"ref": "refs/heads/main", "sha": new_commit_sha},
-            timeout=30
-        )
-        # 422 здесь означает, что ветка уже успела появиться — не критично
-        if r_ref.status_code == 422:
-            log_main("[FIRST-COMMIT] Ветка main уже существует — переходим к обычному пушу")
-            return github_api_force_push_from_tree(tree_sha, commit_message)
-        r_ref.raise_for_status()
-
-        log_both(f"[FIRST-COMMIT] Репозиторий инициализирован, main → {new_commit_sha[:10]}")
-        return new_commit_sha
+        log_both("[INIT-REPO] Первый коммит создан, ветка main инициализирована")
+        return True
     except Exception as e:
-        log_main(f"[FIRST-COMMIT] Ошибка создания первого коммита: {e}")
-        return None
+        log_main(f"[INIT-REPO] Не удалось инициализировать пустой репозиторий: {e}")
+        return False
 
 
 def github_api_force_push_from_tree(tree_sha, commit_message):
@@ -690,9 +695,11 @@ def github_api_force_push_from_tree(tree_sha, commit_message):
         log_main("[PUSH] Не удалось определить состояние main (сеть?) → push отменён")
         return None
 
-    # Ветки main ещё нет → это ПЕРВЫЙ коммит в пустой репозиторий
+    # Пустой репозиторий инициализируется раньше (do_push → github_api_ensure_repo_initialized),
+    # поэтому к моменту пуша main уже существует. Если вдруг нет — отменяем.
     if status == "absent":
-        return _github_api_first_commit(tree_sha, commit_message, headers, base_url)
+        log_main("[PUSH] main отсутствует на момент пуша — репозиторий не инициализирован, push отменён")
+        return None
 
     # Обычный путь: ветка main существует.
     # Force разрешён только для «свежего» репозитория (≤ 1 коммита = только initial).
@@ -752,6 +759,14 @@ def do_push():
     if not is_github_configured():
         log_main("[do_push] GitHub не настроен (username/repo/token) → push пропущен. "
                  "Заполните поля во вкладке Settings.")
+        push_lock = False
+        return
+
+    # Инициализация пустого репозитория ДО сборки tree: на пустом репо Git Data API
+    # (blobs/trees) отдаёт 409 'Git Repository is empty'. Первый коммит создаём через
+    # Contents API, после чего обычный поток работает.
+    if not github_api_ensure_repo_initialized():
+        log_main("[do_push] Репозиторий не готов (пуст/недоступен) → push отменён")
         push_lock = False
         return
 

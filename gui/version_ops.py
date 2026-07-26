@@ -98,6 +98,10 @@ def fetch_pushes(github_user: str, github_repo: str, github_token: str):
             data = resp.json()
             log_soft(f"Получено {len(data)} коммитов")
             return data
+        elif resp.status_code == 409:
+            # Пустой репозиторий (ещё нет коммитов) — это не ошибка, просто нет пушей.
+            log_soft("GitHub: репозиторий пуст (409) — пушей ещё нет")
+            return []
         else:
             log_main(f"GitHub API вернул ошибку: {resp.status_code} - {resp.text[:200]}")
             return []
