@@ -29,3 +29,4 @@ Autosync_git/
 fake_git_temp
 Versions/
 .idea
+/.venv/
