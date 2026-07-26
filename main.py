@@ -15,21 +15,21 @@ import tkinter as tk
 from pathlib import Path
 
 # Подготовка структуры файлов и папок (самое первое действие)
-import require_utils
+import core.bootstrap  # noqa: F401  # side-effect: подготовка структуры приложения
 
-import config
-from app_logger import init_logger, log_both, log_main
-from gui_watcher import start_watcher, stop_watcher, initial_check_loop
-from observer_manager import stop_observer
-from gui_func_adds import show_duplicate_warning
+from core import config
+from core.logger import init_logger, log_both, log_main
+from sync.watcher import start_watcher, stop_watcher, initial_check_loop
+from sync.observer import stop_observer
+from gui.tray import show_duplicate_warning
 
 
 # Single-instance защита
-from defense import SingleInstance
+from core.single_instance import SingleInstance
 
 # GUI импорт
 try:
-    from gui import GitVersionRestoreApp
+    from gui.app import GitVersionRestoreApp
 except ImportError as e:
     print(f"[GUI] GUI модуль не найден: {e}")
     GitVersionRestoreApp = None
@@ -121,7 +121,7 @@ def main():
 
     # 4. Очистка/проверка логов через mem.py
     try:
-        import mem
+        from core import log_trim as mem
         mem.main()
         print("[MEM] Логи проверены и очищены при необходимости")
     except ImportError:
