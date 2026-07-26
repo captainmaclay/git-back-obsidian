@@ -15,14 +15,88 @@ gui/version_ops.py
 
 import os
 import sys
+import json
 import time
+from pathlib import Path
+
 import requests
+from requests.adapters import HTTPAdapter
 import pygit2
 
 from core.logger import log_main, log_soft, log_both
 from core.config import VERSIONS_DIR
 
 IS_WINDOWS = os.name == "nt"
+
+
+# ────────────────────────────────────────────────
+# Отказоустойчивое получение списка коммитов
+# ────────────────────────────────────────────────
+# Идея: сеть к api.github.com периодически даёт ConnectTimeout. Чтобы GUI не
+# «пустел» на каждом моргании, применяем два независимых механизма:
+#   1) requests.Session с автоматическими ретраями и экспоненциальным бэк-оффом
+#      (transient-таймауты/5xx повторяются под капотом);
+#   2) кэш последнего успешного ответа (в памяти + на диске push_cache.json):
+#      при сбое сети показываем последний известный список, а не пустоту.
+# pygit2 здесь НЕ помогает: узкое место — сетевой доступ к GitHub, а не парсинг.
+# Локальный pygit2-мировой репозиторий давал бы устаревшие данные (он не в синхроне
+# с REST-пушами), поэтому как источник списка коммитов он ненадёжен.
+
+_CACHE_FILE = Path(__file__).resolve().parents[1] / "push_cache.json"
+_pushes_cache = {}   # in-memory: repo_key -> list
+
+
+def _build_session() -> requests.Session:
+    """requests.Session с ретраями на connect/read-таймауты и 5xx."""
+    session = requests.Session()
+    try:
+        from urllib3.util.retry import Retry
+        try:
+            retry = Retry(
+                total=3, connect=3, read=3,
+                backoff_factor=1.5,                     # паузы 0, 1.5, 3, 6 сек…
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=frozenset(["GET"]),
+                raise_on_status=False,
+            )
+        except TypeError:
+            # старые версии urllib3 (method_whitelist вместо allowed_methods)
+            retry = Retry(total=3, backoff_factor=1.5,
+                          status_forcelist=(429, 500, 502, 503, 504))
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+    except Exception:
+        pass  # без urllib3.Retry сессия всё равно работает, просто без авто-ретраев
+    return session
+
+
+_session = _build_session()
+
+
+def _cache_load(repo_key: str) -> list:
+    """Возвращает кэш (память → диск) для repo_key, иначе []."""
+    if _pushes_cache.get(repo_key):
+        return _pushes_cache[repo_key]
+    try:
+        data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+        if data.get("repo") == repo_key:
+            _pushes_cache[repo_key] = data.get("pushes", [])
+            return _pushes_cache[repo_key]
+    except Exception:
+        pass
+    return []
+
+
+def _cache_save(repo_key: str, pushes: list) -> None:
+    _pushes_cache[repo_key] = pushes
+    try:
+        _CACHE_FILE.write_text(
+            json.dumps({"repo": repo_key, "pushes": pushes}, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
 
 
 # ────────────────────────────────────────────────
@@ -86,28 +160,43 @@ def open_versions():
 # ────────────────────────────────────────────────
 
 def fetch_pushes(github_user: str, github_repo: str, github_token: str):
-    """Получает последние коммиты из репозитория через GitHub API"""
+    """
+    Получает последние коммиты через GitHub API — отказоустойчиво.
+
+    - ретраи с бэк-оффом (внутри сессии) гасят кратковременные таймауты/5xx;
+    - при полном сбое сети возвращается КЭШ последнего успешного ответа,
+      чтобы список в GUI не обнулялся;
+    - 409 (пустой репозиторий) — не ошибка, просто пушей ещё нет.
+    """
+    repo_key = f"{github_user}/{github_repo}"
     url = f"https://api.github.com/repos/{github_user}/{github_repo}/commits"
     headers = {"Authorization": f"token {github_token}"}
 
-    log_soft(f"Запрашиваем последние коммиты через GitHub API: {url}")
+    log_soft(f"Запрашиваем последние коммиты: {url}")
 
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        # timeout=(connect, read): быстро отсекаем «висящий» коннект, даём время на чтение
+        resp = _session.get(url, headers=headers, timeout=(6, 20))
+
         if resp.status_code == 200:
             data = resp.json()
+            _cache_save(repo_key, data)
             log_soft(f"Получено {len(data)} коммитов")
             return data
-        elif resp.status_code == 409:
-            # Пустой репозиторий (ещё нет коммитов) — это не ошибка, просто нет пушей.
+
+        if resp.status_code == 409:
             log_soft("GitHub: репозиторий пуст (409) — пушей ещё нет")
             return []
-        else:
-            log_main(f"GitHub API вернул ошибку: {resp.status_code} - {resp.text[:200]}")
-            return []
+
+        # прочие ошибки: не роняем список — показываем последний известный кэш
+        cached = _cache_load(repo_key)
+        log_main(f"GitHub API вернул {resp.status_code} — показываю кэш ({len(cached)} коммитов)")
+        return cached
+
     except Exception as e:
-        log_main(f"Ошибка запроса к GitHub API: {type(e).__name__}: {e}")
-        return []
+        cached = _cache_load(repo_key)
+        log_soft(f"Сеть недоступна ({type(e).__name__}) → показываю кэш ({len(cached)} коммитов)")
+        return cached
 
 
 def fetch_commit_comment(commit_sha: str, github_user: str, github_repo: str, github_token: str):
