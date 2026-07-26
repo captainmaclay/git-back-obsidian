@@ -109,6 +109,14 @@ def initialize_app_structure():
     ensure_settings_ini()
     ensure_env_file()  # добавили вызов
 
+    # Чистим .env от лишних пробелов ДО того, как config его прочитает
+    try:
+        from core.env_sanitizer import sanitize_env_file
+        if sanitize_env_file(ENV_FILE):
+            print("[require] .env очищен от лишних пробелов")
+    except Exception as e:
+        print(f"[require] Не удалось очистить .env: {e}")
+
     print("[require] Подготовка структуры завершена")
 
 

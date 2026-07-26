@@ -25,6 +25,7 @@ from PIL import Image, ImageTk
 
 from core.logger import log_main, log_soft
 from core.config import settings, save_watched_folder
+from core.env_sanitizer import sanitize_env_file
 
 
 SETTINGS_FILE = Path(__file__).resolve().parents[1] / "settings.ini"
@@ -249,6 +250,9 @@ class SettingsTab:
 
             with open(env_path, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
+
+            # подчищаем возможные пробелы в начале/конце значений
+            sanitize_env_file(env_path)
 
             self.show_toast("Настройки сохранены в .env")
 
