@@ -52,6 +52,17 @@ WATCHED_FOLDER_STR = os.getenv("WATCHED_FOLDER", watched_default).strip('"')
 WATCHED_FOLDER = Path(WATCHED_FOLDER_STR)
 GITHUB_REPO_URL    = f"https://github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
 GITHUB_PROFILE_URL = f"https://github.com/{GITHUB_USERNAME}/{GITHUB_REPO}"
+
+
+def is_github_configured() -> bool:
+    """
+    True, если заданы логин, репозиторий и токен GitHub.
+    Используется как предохранитель: без этих значений любые обращения к API
+    уходят в /repos/// → 404, а pygit2 падает с 'failed to set credentials'.
+    """
+    return bool(GITHUB_USERNAME and GITHUB_REPO and GITHUB_TOKEN)
+
+
 # Проверяем и создаём, если возможно
 try:
     WATCHED_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -307,6 +318,7 @@ __all__ = [
     "GITHUB_TOKEN",
     "GITHUB_REPO_URL",
     "GITHUB_PROFILE_URL",
+    "is_github_configured",
     "DEBOUNCE_SECONDS",
     "debounce_timer",
     "push_lock",

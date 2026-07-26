@@ -1,15 +1,16 @@
 """
-gui_watcher.py
+sync/watcher.py
 
-Git AutoSync Watcher
+Git AutoSync Watcher:
+- watchdog отслеживает изменения файлов в отслеживаемой папке;
+- debounce гасит «шторм» правок;
+- по debounce запускается do_push (sync/push.py), который через REST API
+  собирает изменения и отправляет их на GitHub.
 
-watchdog отслеживает изменения файлов
-debounce защита
-pygit2 push всегда основной
- если GitHub repo пустой (409) → bootstrap CLI push
-CLI используется только один раз
-никакого flag-файла
- initial_check_loop присутствует
+Инициализация пустого репозитория (первый коммит + ветка main) выполняется
+целиком в sync/push.py (_github_api_first_commit) при первом пуше — поэтому
+здесь больше нет CLI-bootstrap и pygit2 init-push (последний давал ошибку
+'failed to set credentials').
 """
 
 import time
@@ -17,10 +18,8 @@ import threading
 from threading import Timer, Lock
 from pathlib import Path
 import traceback
-import subprocess
 
 import requests
-import pygit2
 from watchdog.events import FileSystemEventHandler
 
 from core.logger import log_main, log_soft
@@ -31,7 +30,7 @@ from core.config import (
     GITHUB_USERNAME,
     GITHUB_REPO,
     GITHUB_TOKEN,
-    REPO_PATH
+    is_github_configured,
 )
 
 from sync.observer import (
@@ -49,123 +48,10 @@ _push_lock = Lock()
 
 _repo_initialized = False
 _push_in_progress = False
-_cli_bootstrap_done = False
 
 debounce_timer: Timer | None = None
 watcher_thread: threading.Thread | None = None
 _watcher_running = False
-
-
-# ─────────────────────────────────────────────
-# GitHub API check: repo empty?
-# ─────────────────────────────────────────────
-
-def github_repo_is_empty() -> bool:
-    """
-    True если GitHub repo реально пустой (409).
-    """
-
-    try:
-        r = requests.get(
-            f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/commits",
-            headers={"Authorization": f"token {GITHUB_TOKEN}"},
-            timeout=5
-        )
-
-        if r.status_code == 409:
-            log_main("[GitHub API] Repo EMPTY (409)")
-            return True
-
-        log_main("[GitHub API] Repo NOT empty")
-        return False
-
-    except Exception as e:
-        # При ошибке НЕ считаем репозиторий пустым: иначе bootstrap CLI сделает
-        # force-push и может перезаписать существующую историю. Безопаснее False.
-        log_main(f"[GitHub API ERROR] {e} → считаем repo НЕ пустым (защита от force)")
-        return False
-
-
-# ─────────────────────────────────────────────
-# CLI Bootstrap exactly как ты указал
-# ─────────────────────────────────────────────
-
-def bootstrap_force_push_cli():
-    """
-    Делает bootstrap push строго командами:
-
-    echo "# repo" >> README.md
-    git init
-    git add README.md
-    git commit -m "first commit"
-    git branch -M main
-    git remote add origin ...
-    git push -u origin main --force
-
-    Запускается ТОЛЬКО если GitHub реально пустой.
-    """
-
-    global _cli_bootstrap_done
-
-    if _cli_bootstrap_done:
-        return
-
-    log_main("[BOOTSTRAP CLI] GitHub пустой → выполняем первый push через CLI")
-
-    repo_dir = Path(REPO_PATH)
-    readme = repo_dir / "README.md"
-
-    try:
-        # 1) README
-        if not readme.exists():
-            readme.write_text(f"# {GITHUB_REPO}\n", encoding="utf-8")
-
-        remote_url = f"https://github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
-
-        commands = [
-            ["git", "init"],
-            ["git", "add", "README.md"],
-            ["git", "commit", "-m", "first commit"],
-            ["git", "branch", "-M", "main"],
-            ["git", "remote", "remove", "origin"],
-        ]
-
-        # origin может не существовать → игнорируем ошибку
-        subprocess.run(
-            ["git", "remote", "remove", "origin"],
-            cwd=REPO_PATH,
-            capture_output=True,
-            text=True
-        )
-
-        # добавляем origin заново
-        subprocess.run(
-            ["git", "remote", "add", "origin", remote_url],
-            cwd=REPO_PATH,
-            check=True,
-            capture_output=True,
-            text=True
-        )
-
-        # push
-        subprocess.run(
-            ["git", "push", "-u", "origin", "main", "--force"],
-            cwd=REPO_PATH,
-            check=True,
-            capture_output=True,
-            text=True
-        )
-
-        log_main("[BOOTSTRAP CLI] Первый push выполнен успешно ")
-        _cli_bootstrap_done = True
-
-    except subprocess.CalledProcessError as e:
-        log_main("[BOOTSTRAP CLI ERROR] push провалился")
-        log_main(e.stdout)
-        log_main(e.stderr)
-
-    except Exception as e:
-        log_main(f"[BOOTSTRAP CLI ERROR] {e}")
 
 
 # ─────────────────────────────────────────────
@@ -244,71 +130,31 @@ def watcher_loop():
                 log_main("[watcher] Observer упал → restart")
                 start_observer()
 
-# ─────────────────────────────────────────────
-# INIT + bootstrap + pygit2 push
-# ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# INIT (лёгкий — реальная инициализация репо идёт через REST при первом пуше)
+# ─────────────────────────────────────────────
 
 def safe_ensure_repository_and_main_branch():
     """
-    Гарантирует что main существует на GitHub.
-    Если repo пустой → bootstrap CLI.
-    Потом всегда pygit2.
+    Раньше здесь делались CLI-bootstrap пустого репозитория и pygit2 init-push.
+    Теперь инициализация пустого репозитория (первый коммит + ветка main) полностью
+    выполняется через REST API в sync/push.py (_github_api_first_commit) при первом
+    же пуше, поэтому отдельный init-push не нужен (он и давал 'failed to set credentials').
+
+    Функция сохранена для совместимости вызовов (start_watcher, GUI).
     """
     global _repo_initialized
 
     with _repo_init_lock:
-
         if _repo_initialized:
             return
 
-        repo_dir = Path(REPO_PATH)
-        remote_url = f"https://github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
-
-        try:
-            # ───────────── repo open/init
-            if not (repo_dir / ".git").exists():
-                repo = pygit2.init_repository(str(repo_dir))
-                log_main("[INIT] Repo создан")
-            else:
-                repo = pygit2.Repository(str(repo_dir))
-                log_main("[INIT] Repo открыт")
-
-            # ───────────── если GitHub пустой → CLI bootstrap
-            if github_repo_is_empty():
-                bootstrap_force_push_cli()
-
-            # ───────────── origin safe
-            try:
-                origin = repo.remotes["origin"]
-            except KeyError:
-                origin = repo.remotes.create("origin", remote_url)
-                log_main("[INIT] origin создан")
-
-            callbacks = pygit2.RemoteCallbacks(
-                credentials=lambda url, user, allowed:
-                    pygit2.UserPass(GITHUB_USERNAME, GITHUB_TOKEN)
-            )
-
-            # ───────────── pygit2 push main (с той же защитой от force, что и do_push)
-            # Init-push форсит ветку (refspec с префиксом '+'), поэтому применяем guard:
-            # force разрешён ТОЛЬКО если в remote main нет других пушей, кроме initial commit.
-            from sync.push import is_force_push_allowed  # ленивый импорт (единый источник правды)
-
-            if is_force_push_allowed():
-                log_main("[INIT PUSH] pygit2 force-push → GitHub (initial-репозиторий)")
-                origin.push(
-                    ["+refs/heads/main:refs/heads/main"],
-                    callbacks=callbacks
-                )
-                log_main("[INIT PUSH] main успешно синхронизирован ")
-            else:
-                log_main("[INIT PUSH] ПРОПУЩЕН: в main уже есть пуши — "
-                         "init force-push истории запрещён (история защищена)")
-
-        except Exception as e:
-            log_main(f"[INIT ERROR] {e}")
-            traceback.print_exc()
+        if not is_github_configured():
+            log_main("[INIT] GitHub не настроен (нет username/repo/token) → "
+                     "заполните поля во вкладке Settings.")
+        else:
+            log_soft("[INIT] Инициализация репозитория выполнится через REST при первом пуше")
 
         _repo_initialized = True
 
@@ -358,17 +204,18 @@ def initial_check_loop():
     report.append("Watcher: OK" if watcher_thread else "Watcher: FAIL")
     report.append("Observer: OK" if is_observer_running() else "Observer: FAIL")
 
-    try:
-        r = requests.get(
-            f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/commits",
-            headers={"Authorization": f"token {GITHUB_TOKEN}"},
-            timeout=5
-        )
-
-        report.append(f"GitHub API: {r.status_code}")
-
-    except Exception as e:
-        report.append(f"GitHub API ERROR: {e}")
+    if is_github_configured():
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/commits",
+                headers={"Authorization": f"token {GITHUB_TOKEN}"},
+                timeout=5
+            )
+            report.append(f"GitHub API: {r.status_code}")
+        except Exception as e:
+            report.append(f"GitHub API ERROR: {e}")
+    else:
+        report.append("GitHub API: не настроен (заполните Settings)")
 
     log_soft("\n".join(report))
 
@@ -379,5 +226,3 @@ __all__ = [
     "initial_check_loop",
     "ChangeHandler"
 ]
-
-

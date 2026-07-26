@@ -38,6 +38,7 @@ from core.config import (
     VERSIONS_DIR,
     FAKE_PUSH_GIT,
     SCRIPT_DIR,
+    is_github_configured,
 )
 
 # Импорт из make_description.py
@@ -285,6 +286,39 @@ def github_api_get_current_head() -> Optional[str]:
             break
     log_main("[API-HEAD] Не удалось получить HEAD после 3 попыток")
     return None
+
+
+def github_api_main_ref() -> Tuple[str, Optional[str]]:
+    """
+    Определяет состояние ветки main в удалённом репозитории:
+      ('exists',  sha)  — ветка есть (sha последнего коммита);
+      ('absent',  None) — репозиторий пуст / ветки main нет (404) → нужен ПЕРВЫЙ коммит;
+      ('unknown', None) — не удалось определить (сеть/ошибка) → действовать нельзя.
+
+    Отличать 'absent' от 'unknown' критично: первый коммит создаём только когда
+    точно знаем, что репозиторий пуст, а не когда просто нет связи.
+    """
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/git/ref/heads/main"
+
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            if r.status_code == 404:
+                log_both("[API-HEAD] main отсутствует (404) → репозиторий пуст, нужен первый коммит")
+                return ("absent", None)
+            r.raise_for_status()
+            sha = r.json()['object']['sha']
+            log_both(f"[API-HEAD] HEAD main: {sha[:10]}...")
+            return ("exists", sha)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            log_main(f"[API-HEAD] Сетевая ошибка (попытка {attempt}): {e}")
+            time.sleep(5 * attempt)
+        except Exception as e:
+            log_main(f"[API-HEAD] Ошибка (попытка {attempt}): {e}")
+            break
+
+    return ("unknown", None)
 
 
 def github_api_get_remote_blobs(sha: str) -> set:
@@ -607,16 +641,60 @@ def is_force_push_allowed() -> bool:
     return allowed
 
 
+def _github_api_first_commit(tree_sha, commit_message, headers, base_url):
+    """
+    ПЕРВЫЙ коммит в пустой репозиторий: создаёт коммит БЕЗ родителей и заводит
+    ветку main через POST /git/refs (её ещё нет, поэтому не PATCH).
+    Аналог веб-инструкции 'git init … git commit … git branch -M main … git push',
+    но полностью через REST API с токеном из .env.
+    """
+    log_both("[FIRST-COMMIT] Пустой репозиторий → создаём первый коммит и ветку main")
+    try:
+        r = requests.post(
+            f"{base_url}/git/commits",
+            headers=headers,
+            json={"message": commit_message, "tree": tree_sha, "parents": []},
+            timeout=30
+        )
+        r.raise_for_status()
+        new_commit_sha = r.json()['sha']
+
+        r_ref = requests.post(
+            f"{base_url}/git/refs",
+            headers=headers,
+            json={"ref": "refs/heads/main", "sha": new_commit_sha},
+            timeout=30
+        )
+        # 422 здесь означает, что ветка уже успела появиться — не критично
+        if r_ref.status_code == 422:
+            log_main("[FIRST-COMMIT] Ветка main уже существует — переходим к обычному пушу")
+            return github_api_force_push_from_tree(tree_sha, commit_message)
+        r_ref.raise_for_status()
+
+        log_both(f"[FIRST-COMMIT] Репозиторий инициализирован, main → {new_commit_sha[:10]}")
+        return new_commit_sha
+    except Exception as e:
+        log_main(f"[FIRST-COMMIT] Ошибка создания первого коммита: {e}")
+        return None
+
+
 def github_api_force_push_from_tree(tree_sha, commit_message):
     log_both(f"[PUSH] push: {commit_message}")
 
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     base_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}"
 
-    current_sha = github_api_get_current_head()
-    if not current_sha:
+    status, current_sha = github_api_main_ref()
+
+    if status == "unknown":
+        log_main("[PUSH] Не удалось определить состояние main (сеть?) → push отменён")
         return None
 
+    # Ветки main ещё нет → это ПЕРВЫЙ коммит в пустой репозиторий
+    if status == "absent":
+        return _github_api_first_commit(tree_sha, commit_message, headers, base_url)
+
+    # Обычный путь: ветка main существует.
     # Force разрешён только для «свежего» репозитория (≤ 1 коммита = только initial).
     # Если в main уже есть другие пуши — force=False, и GitHub отклонит любое
     # не-fast-forward обновление, защищая историю от перезаписи.
@@ -669,6 +747,13 @@ def do_push():
 
     push_lock = True
     log_both("do_push ЗАПУЩЕН")
+
+    # Предохранитель: без логина/репозитория/токена push уходит в /repos/// → 404.
+    if not is_github_configured():
+        log_main("[do_push] GitHub не настроен (username/repo/token) → push пропущен. "
+                 "Заполните поля во вкладке Settings.")
+        push_lock = False
+        return
 
     # root_git_backup = temporarily_evacuate_root_git()   # ← закомментировано
     root_git_backup = None   # отключаем эвакуацию .git
