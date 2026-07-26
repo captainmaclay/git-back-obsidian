@@ -14,13 +14,19 @@ from core.config import FAKE_PUSH_GIT, GITHUB_USERNAME, GITHUB_REPO, GITHUB_TOKE
 
 
 def get_current_branch(repo_path=FAKE_PUSH_GIT):
-    """Возвращает имя текущей ветки"""
+    """
+    Возвращает имя текущей ветки локальной песочницы (fake_git_temp).
+
+    Песочница временная: между пушами и до первого пуша она может НЕ быть
+    git-репозиторием (нет .git). В этом случае это норма — возвращаем 'main'
+    (ветка, в которую и идёт авто-пуш через REST), без шумной ошибки в лог.
+    """
     try:
         repo = pygit2.Repository(str(repo_path))
         return repo.head.shorthand
     except Exception as e:
-        log_main(f"Ошибка получения текущей ветки: {e}")
-        return "unknown"
+        log_soft(f"[branch] Песочница ещё не git-репозиторий ({type(e).__name__}) → показываем 'main'")
+        return "main"
 
 
 
@@ -68,7 +74,9 @@ def change_branch(branch_name, repo_path=FAKE_PUSH_GIT):
             return False
         return True
     except Exception as e:
-        log_main(f"Ошибка переключения на ветку {branch_name}: {e}")
+        # Песочница может быть не инициализирована как git-репозиторий — это не ошибка.
+        log_soft(f"[branch] Не удалось переключить ветку в песочнице ({type(e).__name__}) — "
+                 f"на авто-пуш (всегда в main) это не влияет")
         return False
 
 
