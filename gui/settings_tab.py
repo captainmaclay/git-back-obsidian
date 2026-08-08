@@ -528,7 +528,11 @@ class SettingsTab:
 
     def _save_minimized(self):
         cfg = ConfigParser()
-        cfg["Settings"] = {"start_minimized": str(self.start_minimized_var.get()).lower()}
+        # читаем существующий файл, чтобы НЕ затереть прочие ключи (например, theme)
+        cfg.read(SETTINGS_FILE, encoding="utf-8")
+        if not cfg.has_section("Settings"):
+            cfg.add_section("Settings")
+        cfg.set("Settings", "start_minimized", str(self.start_minimized_var.get()).lower())
 
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             cfg.write(f)

@@ -19,6 +19,7 @@ from gui.tray import setup_tray_and_close_protocol, create_exit_button, create_t
 from sync.watcher import start_watcher, stop_watcher, initial_check_loop
 from gui.branches import get_current_branch
 from gui.settings_tab import SettingsTab, SETTINGS_FILE
+from gui import theme
 
 # Импортируем новую вкладку
 from gui.main_tab import MainTab
@@ -61,6 +62,16 @@ class GitVersionRestoreApp:
 
         self._bind_global_clipboard_hotkeys()
         self._bind_events_and_loggers()
+
+        # Применяем сохранённую тему ко всему интерфейсу (после создания всех виджетов)
+        try:
+            theme.set_current(theme.load_saved())
+            theme.apply_theme(self.root)
+            self._update_theme_btn_text()
+            for m in getattr(self, "_context_menus", []):
+                theme.theme_menu(m)
+        except Exception as e:
+            log_main(f"[THEME] Не удалось применить тему: {e}")
 
         self.root.after(0, self._start_background_tasks)
 
@@ -232,6 +243,27 @@ class GitVersionRestoreApp:
             tk.Button(self.switch, text=text, command=cmd, width=12)\
                 .pack(side=tk.LEFT, padx=4)
 
+        # Переключатель темы — справа от Settings
+        self.theme_btn = tk.Button(self.switch, width=12, command=self._toggle_theme)
+        self.theme_btn.pack(side=tk.LEFT, padx=4)
+        self._update_theme_btn_text()
+
+    def _update_theme_btn_text(self) -> None:
+        # при светлой теме кнопка предлагает Night Theme, при тёмной — Light Theme
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.config(text="Light Theme" if theme.is_dark() else "Night Theme")
+
+    def _toggle_theme(self) -> None:
+        theme.toggle()
+        theme.apply_theme(self.root)
+        self._update_theme_btn_text()
+        for m in getattr(self, "_context_menus", []):
+            try:
+                theme.theme_menu(m)
+            except Exception:
+                pass
+        log_soft(f"Тема: {'night' if theme.is_dark() else 'light'}")
+
     def _create_exit_button(self) -> None:
         font_name = "Minecraftia" if "Minecraftia" in tkfont.families() else "Consolas"
         create_exit_button(self.switch, self.quit_app, font_name)
@@ -341,6 +373,9 @@ class GitVersionRestoreApp:
 
         self.main_tab.log_box_main.bind("<Button-3>", lambda e: self._show_popup(e, menu_main))
         self.log_box_soft.bind("<Button-3>", lambda e: self._show_popup(e, menu_soft))
+
+        # сохраняем для темизации при переключении темы
+        self._context_menus = [menu_main, menu_soft]
 
     def _show_popup(self, event, menu) -> None:
         try:
